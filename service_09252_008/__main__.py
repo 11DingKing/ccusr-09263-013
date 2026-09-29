@@ -9,10 +9,12 @@ import argparse
 import os
 from pathlib import Path
 
+from .application.audit_service import AuditTimelineService
 from .application.booking_service import BookingService
 from .application.catalog_service import CatalogService
 from .application.ports import SystemClock, UuidIdGenerator
 from .interfaces.http_api import create_server
+from .persistence.sqlite_audit_log import SQLiteAuditLog
 from .persistence.sqlite_store import SQLiteStore
 
 ENV_DATA_DIR = "SERVICE_09252_008_DATA_DIR"
@@ -25,13 +27,15 @@ def default_data_dir() -> Path:
     return Path.home() / ".local" / "state" / "service_09252_008"
 
 
-def build_services(data_dir: Path) -> tuple[CatalogService, BookingService, SQLiteStore]:
+def build_services(data_dir: Path) -> tuple[CatalogService, BookingService, SQLiteStore, SQLiteAuditLog]:
     store = SQLiteStore(data_dir / "booking.db")
+    audit_log = SQLiteAuditLog(data_dir / "audit.db")
     clock = SystemClock()
     ids = UuidIdGenerator()
     catalog = CatalogService(store, clock, ids)
-    bookings = BookingService(store, clock, ids)
-    return catalog, bookings, store
+    audit = AuditTimelineService(audit_log, clock, ids)
+    bookings = BookingService(store, clock, ids, audit=audit)
+    return catalog, bookings, store, audit_log
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -42,7 +46,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     data_dir = args.data_dir or default_data_dir()
-    catalog, bookings, store = build_services(data_dir)
+    catalog, bookings, store, audit_log = build_services(data_dir)
     recovered = bookings.recover()  # 重启后恢复超时任务
     if recovered["expired_locks"] or recovered["expired_quotes"]:
         print(f"recovered timeouts: {recovered}")
@@ -55,6 +59,7 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         server.server_close()
         store.close()
+        audit_log.close()
     return 0
 
 

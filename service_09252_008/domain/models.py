@@ -658,3 +658,64 @@ class DomainEvent:
             payload=dict(data.get("payload", {})),
             created_at=dt_from_str(data["created_at"]),
         )
+
+
+# ---------------------------------------------------------------------------
+# 操作审计时间线
+# ---------------------------------------------------------------------------
+
+
+class AuditAction(str, Enum):
+    """运营审计动作类别：覆盖预约生命周期上的关键人工触点。"""
+
+    CREATED = "CREATED"  # 预约创建（申请，含进入候补）
+    MODIFIED = "MODIFIED"  # 预约修改（改期等）
+    CANCELLED = "CANCELLED"  # 预约取消
+    MANUAL_INTERVENTION = "MANUAL_INTERVENTION"  # 运营主管人工介入
+
+
+#: 系统自动触发（请求未携带操作者）时写入的操作者标识
+SYSTEM_OPERATOR = "system"
+
+
+@dataclass(frozen=True)
+class AuditEvent:
+    """操作审计时间线条目。
+
+    ``seq`` 为存储层分配的全局单调递增序号，是时间线唯一的排序依据，
+    因此同一时刻发生的多个事件也有稳定先后；过滤操作者时只筛选不重排。
+    """
+
+    event_id: str
+    booking_id: str | None
+    action: AuditAction
+    operator_id: str
+    occurred_at: datetime
+    summary: str | None = None
+    details: dict[str, Any] = field(default_factory=dict)
+    seq: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "seq": self.seq,
+            "event_id": self.event_id,
+            "booking_id": self.booking_id,
+            "action": self.action.value,
+            "operator_id": self.operator_id,
+            "occurred_at": dt_to_str(self.occurred_at),
+            "summary": self.summary,
+            "details": self.details,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "AuditEvent":
+        return cls(
+            event_id=data["event_id"],
+            booking_id=data.get("booking_id"),
+            action=AuditAction(data["action"]),
+            operator_id=data["operator_id"],
+            occurred_at=dt_from_str(data["occurred_at"]),
+            summary=data.get("summary"),
+            details=dict(data.get("details", {})),
+            seq=int(data.get("seq", 0)),
+        )

@@ -13,10 +13,13 @@ service_09252_008/
 ├── application/       # 应用服务层
 │   ├── ports.py       #   可替换端口：Clock / IdGenerator（测试注入手动时钟与序列 ID）
 │   ├── catalog_service.py  # 目录登记与校验
-│   └── booking_service.py  # 预约状态机：申请/报价/锁定/改期/发运/到货/签到/结算/取消/恢复
+│   ├── booking_service.py  # 预约状态机：申请/报价/锁定/改期/发运/到货/签到/结算/取消/恢复
+│   └── audit_service.py    # 操作审计时间线：追加事件、按序号查询、可按操作者过滤
 ├── persistence/       # 持久化层
 │   ├── store.py       #   存储端口 + 内存实现（快照回滚）
-│   └── sqlite_store.py     # SQLite 实现（BEGIN IMMEDIATE，重启可恢复）
+│   ├── sqlite_store.py     # SQLite 实现（BEGIN IMMEDIATE，重启可恢复）
+│   ├── audit_store.py     #   操作审计时间线端口 + 内存实现（只追加、序号单调）
+│   └── sqlite_audit_log.py #  审计时间线 SQLite 实现（AUTOINCREMENT 序号，独立 audit.db）
 └── interfaces/
     └── http_api.py    # 接口边界：HTTP/JSON API（仅标准库）
 ```
@@ -61,8 +64,17 @@ python3 -m service_09252_008 --host 127.0.0.1 --port 8080
 | POST | `/bookings/{id}/checkin` | 签到 |
 | POST | `/bookings/{id}/settle` | 结算（`actual_attendance`、可选 `damaged`） |
 | POST | `/bookings/{id}/cancel` | 取消（释放候补、按规则记损耗） |
+| POST | `/bookings/{id}/interventions` | 人工介入登记（不改状态机，只在审计链留痕） |
+| GET  | `/bookings/{id}/timeline` | 该预约的操作审计链（可带 `?operator_id=` 再过滤） |
+| GET  | `/audit/timeline` | 全量操作审计时间线（可带 `?operator_id=` 按操作者过滤） |
 | POST | `/admin/recover` | 恢复超时任务 |
 | GET  | `/bookings/{id}` `/health` | 查询 |
+
+操作审计时间线把预约**创建、修改（改期）、取消与人工介入**串成一条链：
+事件由 Python 以 `INSERT` 追加到独立的 `audit.db`（`audit_timeline` 表），
+序号由 SQLite `AUTOINCREMENT` 单调分配；查询固定 `ORDER BY seq`，
+按 `operator_id` 过滤只筛选事件、不改变相对顺序（过滤结果是全量序列的子序列）。
+操作者经载荷字段 `operator_id` 或请求头 `X-Operator-Id` 传入；未携带时记为 `system`。
 
 幂等键经请求头 `Idempotency-Key` 或载荷字段 `idempotency_key` 传入；
 同键重放返回首次结果（`idempotent_replay: true`），同键不同载荷返回 409。
@@ -75,7 +87,8 @@ python3 -m unittest discover -s tests -v
 
 覆盖：主流程端到端、前置培训/容量/安全/互斥/运输周期规则、跨时区、
 幂等重放、并发锁定（内存与 SQLite 双后端）、重启后超时恢复、
-部分到货与在途损耗、取消释放候补与损耗记录、HTTP 接口边界。
+部分到货与在途损耗、取消释放候补与损耗记录、HTTP 接口边界、
+操作审计时间线（四类动作串链、按操作者过滤顺序不变、SQLite 追加落库与重启续序）。
 
 ## 编译检查
 

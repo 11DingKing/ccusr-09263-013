@@ -9,6 +9,7 @@ import json
 import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
+from urllib.parse import parse_qs
 
 from ..application.booking_service import BookingService
 from ..application.catalog_service import (
@@ -68,7 +69,14 @@ def build_router(catalog: CatalogService, bookings: BookingService) -> _Router:
         key = headers.get("idempotency-key")
         if key and "idempotency_key" not in payload:
             payload = {**payload, "idempotency_key": key}
+        operator = headers.get("x-operator-id")
+        if operator and "operator_id" not in payload:
+            payload = {**payload, "operator_id": operator}
         return payload
+
+    def query_operator(headers: dict[str, str]) -> str | None:
+        operator = headers["__query__"].get("operator_id")
+        return operator if operator else None
 
     # 目录登记
     router.add("POST", "/packages", lambda body, hdr: catalog.create_package(body))
@@ -138,6 +146,25 @@ def build_router(catalog: CatalogService, bookings: BookingService) -> _Router:
         lambda body, hdr: bookings.cancel(hdr["__path__"]["booking_id"], with_idempotency_key(body, hdr)),
     )
     router.add("POST", "/admin/recover", lambda body, hdr: bookings.recover())
+    router.add(
+        "GET",
+        "/bookings/{booking_id}/timeline",
+        lambda body, hdr: bookings.get_booking_timeline(
+            hdr["__path__"]["booking_id"], operator_id=query_operator(hdr)
+        ),
+    )
+    router.add(
+        "GET",
+        "/audit/timeline",
+        lambda body, hdr: {"items": bookings.get_timeline(operator_id=query_operator(hdr))},
+    )
+    router.add(
+        "POST",
+        "/bookings/{booking_id}/interventions",
+        lambda body, hdr: bookings.manual_intervention(
+            hdr["__path__"]["booking_id"], with_idempotency_key(body, hdr)
+        ),
+    )
     router.add("GET", "/health", lambda body, hdr: {"status": "ok"})
     return router
 
@@ -159,7 +186,8 @@ def make_handler_class(router: _Router) -> type[BaseHTTPRequestHandler]:
             self.wfile.write(body)
 
         def _dispatch(self, method: str) -> None:
-            path = self.path.split("?", 1)[0].rstrip("/") or "/"
+            raw_path, _, raw_query = self.path.partition("?")
+            path = raw_path.rstrip("/") or "/"
             matched = router.match(method, path)
             if matched is None:
                 self._send_json(404, {"error": "not_found", "message": f"no route for {method} {path}"})
@@ -176,6 +204,9 @@ def make_handler_class(router: _Router) -> type[BaseHTTPRequestHandler]:
                     body = parsed
                 headers = {k.lower(): v for k, v in self.headers.items()}
                 headers["__path__"] = path_params  # type: ignore[assignment]
+                headers["__query__"] = {  # type: ignore[assignment]
+                    k: v[-1] for k, v in parse_qs(raw_query, keep_blank_values=True).items()
+                }
                 result = handler(body, headers)
                 status = 201 if method == "POST" and path == "/bookings" else 200
                 self._send_json(status, result)

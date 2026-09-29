@@ -112,6 +112,56 @@ class HttpApiTests(unittest.TestCase):
         self.assertIn("expired_locks", body)
         self.assertIn("expired_quotes", body)
 
+    def test_audit_timeline_operator_header_and_filter(self) -> None:
+        operator = "op_http_li"
+        apply_body = {
+            "institution": "审计学院",
+            "package_id": self.ids["package_id"],
+            "mentor_id": self.ids["mentor_id"],
+            "resource_id": self.ids["resource_id"],
+            "window_id": self.ids["window_id"],
+            "seats": 4,
+            "slot_start": "2026-10-01T02:00:00+00:00",
+            "slot_end": "2026-10-01T04:00:00+00:00",
+        }
+        status, applied = self._request(
+            "POST",
+            "/bookings",
+            apply_body,
+            headers={"Idempotency-Key": "http-audit-apply", "X-Operator-Id": operator},
+        )
+        self.assertEqual(status, 201)
+        booking_id = applied["booking_id"]
+
+        status, body = self._request(
+            "POST",
+            f"/bookings/{booking_id}/interventions",
+            {"summary": "运营主管回放确认"},
+            headers={"X-Operator-Id": "supervisor_http"},
+        )
+        self.assertEqual(status, 200)
+
+        # 全量链：创建 -> 人工介入，序号递增
+        status, body = self._request("GET", f"/bookings/{booking_id}/timeline")
+        self.assertEqual(status, 200)
+        self.assertEqual([e["action"] for e in body], ["CREATED", "MANUAL_INTERVENTION"])
+        self.assertEqual([e["operator_id"] for e in body], [operator, "supervisor_http"])
+        seqs = [e["seq"] for e in body]
+        self.assertTrue(all(s1 < s2 for s1, s2 in zip(seqs, seqs[1:])))
+
+        # 按操作者过滤：只剩创建事件，且序号与全量中一致（顺序不变）
+        status, filtered = self._request("GET", f"/audit/timeline?operator_id={operator}")
+        self.assertEqual(status, 200)
+        self.assertEqual([e["seq"] for e in filtered["items"]], [seqs[0]])
+        self.assertTrue(all(e["operator_id"] == operator for e in filtered["items"]))
+
+        # 全局时间线包含过滤结果作为其子序列
+        status, all_events = self._request("GET", "/audit/timeline")
+        self.assertEqual(status, 200)
+        all_seqs = [e["seq"] for e in all_events["items"]]
+        self.assertEqual(all_seqs, sorted(all_seqs))
+        self.assertIn(seqs[0], all_seqs)
+
 
 if __name__ == "__main__":
     unittest.main()
