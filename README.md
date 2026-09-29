@@ -54,18 +54,27 @@ python3 -m service_09252_008 --host 127.0.0.1 --port 8080
 | POST | `/bookings` | 申请（需幂等键） |
 | POST | `/bookings/{id}/quote` | 报价 |
 | POST | `/bookings/{id}/lock` | 锁定（需幂等键，可带 `ttl_seconds`） |
-| POST | `/bookings/{id}/reschedule` | 改期（发运后拒绝） |
+| POST | `/bookings/{id}/reschedule` | 改期（发运后拒绝），记入审计时间线（修改） |
 | POST | `/bookings/{id}/ship` | 发运（需幂等键） |
 | POST | `/shipments/{id}/arrivals` | 到货（支持部分到货） |
 | POST | `/shipments/{id}/losses` | 在途损耗登记 |
 | POST | `/bookings/{id}/checkin` | 签到 |
 | POST | `/bookings/{id}/settle` | 结算（`actual_attendance`、可选 `damaged`） |
-| POST | `/bookings/{id}/cancel` | 取消（释放候补、按规则记损耗） |
+| POST | `/bookings/{id}/cancel` | 取消（释放候补、按规则记损耗），记入审计时间线 |
+| POST | `/bookings/{id}/intervene` | 人工介入登记（需 `operator`、`note`，不改状态，只入审计时间线） |
+| GET  | `/bookings/{id}/timeline` | 该预约的操作审计时间线（可 `?operator=` 过滤） |
+| GET  | `/audit/timeline` | 全部预约的操作审计时间线（可 `?operator=` 过滤） |
 | POST | `/admin/recover` | 恢复超时任务 |
 | GET  | `/bookings/{id}` `/health` | 查询 |
 
 幂等键经请求头 `Idempotency-Key` 或载荷字段 `idempotency_key` 传入；
 同键重放返回首次结果（`idempotent_replay: true`），同键不同载荷返回 409。
+
+操作者经请求头 `X-Operator` 或载荷字段 `operator` 传入（缺省为 `system`），
+随创建、改期、取消与人工介入追加到只增的**操作审计时间线**。
+时间线事件带单调递增的事件序号 `seq`，查询始终按 `seq` 升序返回；
+按操作者过滤只筛选事件、不改变顺序，过滤结果是全量链的子序列。
+事件在业务事务内追加，业务失败随事务回滚，SQLite 重启后仍可按序号复现整条链。
 
 ## 测试
 
@@ -83,4 +92,5 @@ python3 -m unittest discover -s tests -v
 python3 -m compileall -q service_09252_008 tests
 ```
 
-扩展模块覆盖证据、审批、权限、留存、对账与恢复等业务边界。
+扩展模块覆盖证据、审批、权限、留存、对账与恢复等业务边界；
+`governance_extensions/audit_timeline.py` 提供操作审计时间线（创建/修改/取消/人工介入，按事件序号成链）。

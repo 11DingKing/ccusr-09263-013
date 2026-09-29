@@ -56,6 +56,15 @@ from ..domain.rules import (
     plan_material_allocation,
     safety_ceiling,
 )
+from ..governance_extensions.audit_timeline import (
+    ACTION_BOOKING_CANCELLED,
+    ACTION_BOOKING_CREATED,
+    ACTION_BOOKING_MODIFIED,
+    ACTION_MANUAL_INTERVENTION,
+    append_audit_event,
+    normalize_operator,
+    query_audit_events,
+)
 from ..persistence.store import Store
 from .catalog_service import (
     COLLECTION_BATCHES,
@@ -115,6 +124,29 @@ class BookingService:
             created_at=self._clock.now(),
         )
         self._store.put(COLLECTION_EVENTS, event.event_id, event.to_dict())
+
+    def _audit(
+        self, booking_id: str, action: str, operator: str, detail: dict[str, Any] | None = None
+    ) -> None:
+        """在当前事务内追加操作审计时间线事件（随业务写入同提交/同回滚）。"""
+        append_audit_event(
+            self._store,
+            booking_id=booking_id,
+            action=action,
+            operator=operator,
+            occurred_at=dt_to_str(self._clock.now()),
+            detail=detail or {},
+        )
+
+    def _operator(self, request: dict[str, Any], *, required: bool = False) -> str:
+        """从请求中解析操作者；人工介入要求显式给出，其余缺省为 system。"""
+        raw = request.get("operator")
+        if raw is None and required:
+            raise ValidationError("field operator is required for this operation")
+        try:
+            return normalize_operator(raw)
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from exc
 
     def _idempotent(
         self,
@@ -309,6 +341,12 @@ class BookingService:
                 "seats": seats,
                 "waitlist_reason": waitlist_reason,
             },
+        )
+        self._audit(
+            candidate.booking_id,
+            ACTION_BOOKING_CREATED,
+            self._operator(request),
+            {"waitlist_reason": waitlist_reason, "seats": seats},
         )
         return self._booking_view(candidate)
 
@@ -506,6 +544,16 @@ class BookingService:
             "booking_rescheduled",
             booking.booking_id,
             {"slot_start": dt_to_str(slot_start), "slot_end": dt_to_str(slot_end)},
+        )
+        self._audit(
+            booking.booking_id,
+            ACTION_BOOKING_MODIFIED,
+            self._operator(request),
+            {
+                "change": "reschedule",
+                "slot_start": dt_to_str(slot_start),
+                "slot_end": dt_to_str(slot_end),
+            },
         )
         return self._booking_view(booking)
 
@@ -861,9 +909,49 @@ class BookingService:
         booking.lock_expires_at = None
         self._save_booking(booking)
         self._emit("booking_cancelled", booking_id, {"reason": reason})
+        self._audit(
+            booking_id,
+            ACTION_BOOKING_CANCELLED,
+            self._operator(request),
+            {"reason": reason},
+        )
         # 容量/互斥资源可能已释放，按规则尝试晋级候补（无候补时为 no-op）
         self._promote_waitlist(booking.window_id)
         return self._booking_view(booking)
+
+    # ------------------------------------------------------------------
+    # 人工介入（运营主管处置：不改状态机，只留痕，进入审计时间线）
+    # ------------------------------------------------------------------
+
+    def intervene(self, booking_id: str, request: dict[str, Any]) -> dict[str, Any]:
+        """登记一次人工介入：必须给出操作者与处置说明，不改变预约状态。"""
+        key = request.get("idempotency_key")
+        return self._idempotent(
+            "intervene",
+            key,
+            {"booking_id": booking_id, **request},
+            lambda: self._intervene(booking_id, request),
+            required=False,
+        )
+
+    def _intervene(self, booking_id: str, request: dict[str, Any]) -> dict[str, Any]:
+        booking = self._load_booking(booking_id)
+        operator = self._operator(request, required=True)
+        note = request.get("note")
+        if not isinstance(note, str) or not note.strip():
+            raise ValidationError("field note must be a non-empty string")
+        self._emit(
+            "manual_intervention",
+            booking_id,
+            {"operator": operator, "note": note.strip()},
+        )
+        self._audit(
+            booking_id,
+            ACTION_MANUAL_INTERVENTION,
+            operator,
+            {"note": note.strip(), "status": booking.status.value},
+        )
+        return self._booking_view(self._load_booking(booking_id))
 
     def _release_reservations(self, booking: Booking) -> None:
         """释放未发运的预占库存。"""
@@ -1003,6 +1091,22 @@ class BookingService:
     def list_bookings(self, **filters: Any) -> list[dict[str, Any]]:
         return [self._booking_view(Booking.from_dict(b)) for b in self._store.query(COLLECTION_BOOKINGS, **filters)]
 
+    def get_audit_timeline(self, booking_id: str | None = None, *, operator: str | None = None) -> dict[str, Any]:
+        """操作审计时间线：按事件序号升序，可按操作者过滤（过滤不改变顺序）。"""
+        if booking_id is not None:
+            # 预约必须存在，避免对不存在的预约回放出空链而不报错
+            self._load_booking(booking_id)
+        if operator is not None:
+            try:
+                operator_filter = normalize_operator(operator)
+            except ValueError as exc:
+                raise ValidationError(str(exc)) from exc
+        else:
+            operator_filter = None
+        with self._store.transaction():
+            events = query_audit_events(self._store, booking_id=booking_id, operator=operator_filter)
+        return {"items": events}
+
     def _booking_view(self, booking: Booking) -> dict[str, Any]:
         view = booking.to_dict()
         view["reservations"] = [r.to_dict() for r in self._reservations_of(booking.booking_id)]
@@ -1014,6 +1118,7 @@ class BookingService:
         events = [e for e in self._store.query(COLLECTION_EVENTS, booking_id=booking.booking_id)]
         events.sort(key=lambda e: (e["created_at"], e["event_id"]))
         view["events"] = events
+        view["audit_timeline"] = query_audit_events(self._store, booking_id=booking.booking_id)
         if booking.status == BookingStatus.WAITLISTED:
             ahead = [
                 b

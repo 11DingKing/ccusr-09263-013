@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import re
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
 
@@ -70,6 +71,13 @@ def build_router(catalog: CatalogService, bookings: BookingService) -> _Router:
             payload = {**payload, "idempotency_key": key}
         return payload
 
+    def with_operator(payload: dict[str, Any], headers: dict[str, str]) -> dict[str, Any]:
+        # 操作者经 X-Operator 头传入，进入操作审计时间线；载荷显式给出时不覆盖
+        operator = headers.get("x-operator")
+        if operator and "operator" not in payload:
+            payload = {**payload, "operator": operator}
+        return payload
+
     # 目录登记
     router.add("POST", "/packages", lambda body, hdr: catalog.create_package(body))
     router.add("POST", "/mentors", lambda body, hdr: catalog.create_mentor(body))
@@ -88,7 +96,11 @@ def build_router(catalog: CatalogService, bookings: BookingService) -> _Router:
     )
 
     # 预约流程
-    router.add("POST", "/bookings", lambda body, hdr: bookings.apply(with_idempotency_key(body, hdr)))
+    router.add(
+        "POST",
+        "/bookings",
+        lambda body, hdr: bookings.apply(with_operator(with_idempotency_key(body, hdr), hdr)),
+    )
     router.add("GET", "/bookings/{booking_id}", lambda body, hdr: bookings.get_booking(hdr["__path__"]["booking_id"]))
     router.add(
         "POST",
@@ -103,7 +115,9 @@ def build_router(catalog: CatalogService, bookings: BookingService) -> _Router:
     router.add(
         "POST",
         "/bookings/{booking_id}/reschedule",
-        lambda body, hdr: bookings.reschedule(hdr["__path__"]["booking_id"], with_idempotency_key(body, hdr)),
+        lambda body, hdr: bookings.reschedule(
+            hdr["__path__"]["booking_id"], with_operator(with_idempotency_key(body, hdr), hdr)
+        ),
     )
     router.add(
         "POST",
@@ -135,7 +149,31 @@ def build_router(catalog: CatalogService, bookings: BookingService) -> _Router:
     router.add(
         "POST",
         "/bookings/{booking_id}/cancel",
-        lambda body, hdr: bookings.cancel(hdr["__path__"]["booking_id"], with_idempotency_key(body, hdr)),
+        lambda body, hdr: bookings.cancel(
+            hdr["__path__"]["booking_id"], with_operator(with_idempotency_key(body, hdr), hdr)
+        ),
+    )
+    router.add(
+        "POST",
+        "/bookings/{booking_id}/intervene",
+        lambda body, hdr: bookings.intervene(
+            hdr["__path__"]["booking_id"], with_operator(with_idempotency_key(body, hdr), hdr)
+        ),
+    )
+    router.add(
+        "GET",
+        "/bookings/{booking_id}/timeline",
+        lambda body, hdr: bookings.get_audit_timeline(
+            hdr["__path__"]["booking_id"],
+            operator=(hdr["__query__"].get("operator", [None])[0]),
+        ),
+    )
+    router.add(
+        "GET",
+        "/audit/timeline",
+        lambda body, hdr: bookings.get_audit_timeline(
+            operator=hdr["__query__"].get("operator", [None])[0]
+        ),
     )
     router.add("POST", "/admin/recover", lambda body, hdr: bookings.recover())
     router.add("GET", "/health", lambda body, hdr: {"status": "ok"})
@@ -159,7 +197,8 @@ def make_handler_class(router: _Router) -> type[BaseHTTPRequestHandler]:
             self.wfile.write(body)
 
         def _dispatch(self, method: str) -> None:
-            path = self.path.split("?", 1)[0].rstrip("/") or "/"
+            raw_path, _, raw_query = self.path.partition("?")
+            path = raw_path.rstrip("/") or "/"
             matched = router.match(method, path)
             if matched is None:
                 self._send_json(404, {"error": "not_found", "message": f"no route for {method} {path}"})
@@ -176,6 +215,7 @@ def make_handler_class(router: _Router) -> type[BaseHTTPRequestHandler]:
                     body = parsed
                 headers = {k.lower(): v for k, v in self.headers.items()}
                 headers["__path__"] = path_params  # type: ignore[assignment]
+                headers["__query__"] = urllib.parse.parse_qs(raw_query)  # type: ignore[assignment]
                 result = handler(body, headers)
                 status = 201 if method == "POST" and path == "/bookings" else 200
                 self._send_json(status, result)
